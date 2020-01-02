@@ -164,7 +164,7 @@ object RepoCli {
       urlArg         <- cli.peek(UrlArg).ascribe(exoskeleton.MissingArg("url"))
       repo           <- repoOpt.ascribe(exoskeleton.InvalidArgValue("url", urlArg))
       suggested      <- repo.projectName
-      _              <- repo.fetch(layout, https)
+      _              <- repo.fetch(layout, https, shallow = true)
 
       commit         <- repo.getCommitFromTag(layout, refSpec).toOption.ascribe(
                             exoskeleton.InvalidArgValue("refspec", refSpec.id))
