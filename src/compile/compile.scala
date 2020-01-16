@@ -69,12 +69,15 @@ object BloopServer {
   private def connect(dir: Path, multiplexer: Multiplexer[ModuleRef, CompileEvent],
       compilation: Compilation, targetId: TargetId, layout: Layout)(implicit log: Log): Future[Connection] =
     singleTasking { promise =>
+      import org.apache.commons.io.output.TeeOutputStream
+      val serverlog = new FileOutputStream("server.log", true)
+      val clientlog = new FileOutputStream("client.log", true)
       val serverIoPipe = Pipe.open()
       val serverIn = Channels.newInputStream(serverIoPipe.source())
-      val clientOut = Channels.newOutputStream(serverIoPipe.sink())
+      val clientOut = new TeeOutputStream(Channels.newOutputStream(serverIoPipe.sink()), clientlog)
       val clientIoPipe = Pipe.open()
       val clientIn = Channels.newInputStream(clientIoPipe.source())
-      val serverOut = Channels.newOutputStream(clientIoPipe.sink())
+      val serverOut = new TeeOutputStream(Channels.newOutputStream(clientIoPipe.sink()), serverlog)
 
       val logging: PrintStream = log.stream { str =>
         (if(str.indexOf("[D]") == 9) str.drop(17) else str) match {
@@ -528,19 +531,11 @@ case class Compilation(graph: Target.Graph,
   def cleanCaches(target: Target,
                     layout: Layout,
                     multiplexer: Multiplexer[ModuleRef, CompileEvent])(implicit log: Log)
-  : Future[Boolean] = Future.fromTry {
-    val uri: String = str"file://${layout.workDir(target.id).value}?id=${target.id.key}"
+  : Future[CleanCacheResult] = Future.fromTry {
+    val uri: String = str"file:${layout.workDir(target.id).value}/?id=${target.id.key}"
     val params = new CleanCacheParams(List(new BuildTargetIdentifier(uri)).asJava)
     BloopServer.borrow(layout.baseDir, multiplexer, this, target.id, layout) { conn =>
-      val result: Try[CleanCacheResult] = {
-        for {
-          res <- wrapServerErrors(conn.server.buildTargetCleanCache(params))
-        } yield {
-          log.info(s"Clean cache returned ${res.toString}")
-          res
-        }
-      }
-      result.map(_.getCleaned.booleanValue)
+      wrapServerErrors(conn.server.buildTargetCleanCache(params))
     }.flatten
   }
 
@@ -552,25 +547,29 @@ case class Compilation(graph: Target.Graph,
                     args: List[String])(implicit log: Log)
   : Future[CompileResult] = Future.fromTry {
 
-    val uri: String = str"file://${layout.workDir(target.id).value}?id=${target.id.key}"
+    val uri: String = str"file:${layout.workDir(target.id).value}/?id=${target.id.key}"
     val params = new CompileParams(List(new BuildTargetIdentifier(uri)).asJava)
     if(pipelining) params.setArguments(List("--pipeline").asJava)
     val furyTargetIds = deepDependencies(target.id).toList
     
     val bspTargetIds = furyTargetIds.map { dep =>
-      new BuildTargetIdentifier(str"file://${layout.workDir(dep).value}?id=${dep.key}")
+      new BuildTargetIdentifier(str"file:${layout.workDir(dep).value}/?id=${dep.key}")
     }
     
     val bspToFury = (bspTargetIds zip furyTargetIds).toMap
     val scalacOptionsParams = new ScalacOptionsParams(bspTargetIds.asJava)
 
     BloopServer.borrow(layout.baseDir, multiplexer, this, target.id, layout) { conn =>
-      
+      val x = System.currentTimeMillis()
+      log.info(s"$x Compile params ${params.toString}")
       val result: Try[CompileResult] = {
         for {
           res <- wrapServerErrors(conn.server.buildTargetCompile(params))
           opts <- wrapServerErrors(conn.server.buildTargetScalacOptions(scalacOptionsParams))
-        } yield CompileResult(res, opts)
+        } yield {
+          log.info(s"$x Compile result ${res.toString}")
+          CompileResult(res, opts)
+        }
       }
 
       result.get.scalacOptions.getItems.asScala.foreach { case soi =>
@@ -630,7 +629,8 @@ case class Compilation(graph: Target.Graph,
           }
           Future.successful(required)
         } else {
-          cleanCaches(target, layout, multiplexer).flatMap{ _ =>
+          cleanCaches(target, layout, multiplexer).flatMap{ result =>
+            log.info(s"Clean cache returned ${result.toString}")
             compileModule(target, layout, multiplexer, pipelining, globalPolicy, args)
           }
         }
